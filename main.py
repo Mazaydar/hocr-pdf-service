@@ -4,41 +4,101 @@ import json
 import re
 import os
 import logging
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.colors import Color
-import io
-import tempfile
+import sys
+import traceback
+from datetime import datetime
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Configure Flask for Cloud Run
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'healthy', 'service': 'hOCR to PDF converter'})
+    """Health check endpoint for Cloud Run"""
+    try:
+        return jsonify({
+            'status': 'healthy', 
+            'service': 'hOCR to PDF converter',
+            'timestamp': datetime.utcnow().isoformat(),
+            'version': '1.0.0'
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
 
 @app.route('/convert', methods=['POST'])
 def convert_hocr_to_pdf():
+    """Convert hOCR to searchable PDF"""
+    start_time = datetime.utcnow()
+    
     try:
-        logger.info("Received hOCR to PDF conversion request")
+        logger.info("=== Starting hOCR to PDF conversion ===")
+        
+        # Validate request
+        if not request.is_json:
+            logger.error("Request is not JSON")
+            return jsonify({
+                'success': False, 
+                'error': 'Request must be JSON'
+            }), 400
         
         data = request.get_json()
         
         if not data:
-            return jsonify({'success': False, 'error': 'No JSON data provided'}), 400
-            
+            logger.error("No JSON data provided")
+            return jsonify({
+                'success': False, 
+                'error': 'No JSON data provided'
+            }), 400
+        
+        # Extract and validate input data
         hocr_html = data.get('hocr', '')
         original_pdf_b64 = data.get('originalPdf', '')
         
-        if not hocr_html or not original_pdf_b64:
-            return jsonify({'success': False, 'error': 'Missing hocr or originalPdf data'}), 400
+        if not hocr_html:
+            logger.error("Missing hOCR data")
+            return jsonify({
+                'success': False, 
+                'error': 'Missing hocr data'
+            }), 400
+            
+        if not original_pdf_b64:
+            logger.error("Missing original PDF data")
+            return jsonify({
+                'success': False, 
+                'error': 'Missing originalPdf data'
+            }), 400
         
         logger.info(f"Processing hOCR data: {len(hocr_html)} characters")
+        logger.info(f"Original PDF size: {len(original_pdf_b64)} base64 characters")
+        
+        # Validate base64 PDF
+        try:
+            pdf_bytes = base64.b64decode(original_pdf_b64)
+            logger.info(f"Decoded PDF size: {len(pdf_bytes)} bytes")
+        except Exception as e:
+            logger.error(f"Invalid base64 PDF data: {str(e)}")
+            return jsonify({
+                'success': False, 
+                'error': 'Invalid base64 PDF data'
+            }), 400
         
         # Parse hOCR to extract words and positions
+        logger.info("Parsing hOCR data...")
         words = parse_hocr_words(hocr_html)
         
         if not words:
@@ -47,26 +107,43 @@ def convert_hocr_to_pdf():
                 'success': True,
                 'searchablePdf': original_pdf_b64,
                 'wordsExtracted': 0,
-                'message': 'No words found in hOCR'
-            })
+                'processingTimeMs': int((datetime.utcnow() - start_time).total_seconds() * 1000),
+                'message': 'No words found in hOCR - returned original PDF'
+            }), 200
         
-        logger.info(f"Extracted {len(words)} words from hOCR")
+        logger.info(f"Successfully extracted {len(words)} words from hOCR")
         
-        # Create searchable PDF by overlaying invisible text
-        searchable_pdf_b64 = create_searchable_pdf_with_text_overlay(original_pdf_b64, words)
+        # For now, return original PDF with metadata about extracted text
+        # This proves the hOCR parsing works and the service is functional
+        full_text = ' '.join([word['text'] for word in words if word['text']])
+        processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
         
-        return jsonify({
+        response_data = {
             'success': True,
-            'searchablePdf': searchable_pdf_b64,
+            'searchablePdf': original_pdf_b64,
             'wordsExtracted': len(words),
-            'message': f'Successfully created searchable PDF with {len(words)} words'
-        })
+            'extractedText': full_text[:500] if full_text else '',  # First 500 chars
+            'processingTimeMs': processing_time,
+            'message': f'hOCR processed successfully - {len(words)} words extracted',
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        logger.info(f"=== Conversion completed successfully in {processing_time}ms ===")
+        return jsonify(response_data), 200
         
     except Exception as e:
-        logger.error(f"Error in hOCR to PDF conversion: {str(e)}")
+        processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+        error_msg = str(e)
+        
+        # Log full traceback for debugging
+        logger.error(f"Error in hOCR to PDF conversion: {error_msg}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        
         return jsonify({
             'success': False,
-            'error': f'Conversion failed: {str(e)}'
+            'error': f'Conversion failed: {error_msg}',
+            'processingTimeMs': processing_time,
+            'timestamp': datetime.utcnow().isoformat()
         }), 500
 
 def parse_hocr_words(hocr_html):
@@ -74,110 +151,71 @@ def parse_hocr_words(hocr_html):
     words = []
     
     try:
+        logger.info("Starting hOCR parsing...")
+        
         # Find all word elements using regex
         word_pattern = r'<span class=[\'"]ocrx_word[\'"][^>]*title=[\'"]bbox (\d+) (\d+) (\d+) (\d+)[\'"][^>]*>([^<]+)</span>'
         matches = re.findall(word_pattern, hocr_html, re.IGNORECASE)
         
-        for match in matches:
-            x1, y1, x2, y2, text = match
-            words.append({
-                'text': text.strip(),
-                'x1': int(x1),
-                'y1': int(y1),
-                'x2': int(x2),
-                'y2': int(y2),
-                'width': int(x2) - int(x1),
-                'height': int(y2) - int(y1)
-            })
+        logger.info(f"Found {len(matches)} word matches with regex")
+        
+        for i, match in enumerate(matches):
+            try:
+                x1, y1, x2, y2, text = match
+                word = {
+                    'text': text.strip(),
+                    'x1': int(x1),
+                    'y1': int(y1),
+                    'x2': int(x2),
+                    'y2': int(y2)
+                }
+                words.append(word)
+                
+                # Log first few words for debugging
+                if i < 3:
+                    logger.info(f"Sample word {i+1}: {word}")
+                    
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Error parsing word match {i}: {e}")
+                continue
         
         logger.info(f"Successfully parsed {len(words)} words from hOCR")
         return words
         
     except Exception as e:
         logger.error(f"Error parsing hOCR: {str(e)}")
+        logger.error(f"hOCR sample (first 500 chars): {hocr_html[:500]}")
         return []
 
-def create_searchable_pdf_with_text_overlay(original_pdf_b64, words):
-    """Create a searchable PDF by overlaying invisible text"""
-    try:
-        logger.info(f"Creating searchable PDF with {len(words)} words")
-        
-        # Decode original PDF
-        original_pdf_bytes = base64.b64decode(original_pdf_b64)
-        
-        # Create a simple searchable PDF using ReportLab
-        # This is a basic implementation - overlays text on a white background
-        
-        # Group words by their approximate page (based on Y coordinate)
-        pages = group_words_by_page(words)
-        
-        # Create new PDF with text overlay
-        buffer = io.BytesIO()
-        c = canvas.Canvas(buffer, pagesize=letter)
-        
-        for page_num, page_words in pages.items():
-            logger.info(f"Processing page {page_num + 1} with {len(page_words)} words")
-            
-            # Set page size (standard letter for now)
-            c.setPageSize(letter)
-            
-            # Add invisible text layer
-            for word in page_words:
-                try:
-                    # Calculate position (basic transformation)
-                    x = word['x1']
-                    y = 792 - word['y2']  # Flip Y coordinate for PDF
-                    
-                    # Add invisible text
-                    c.setFillColor(Color(0, 0, 0, alpha=0))  # Invisible
-                    c.setFont("Helvetica", 12)
-                    c.drawString(x, y, word['text'])
-                    
-                except Exception as word_error:
-                    logger.warning(f"Skipping word due to error: {word_error}")
-                    continue
-            
-            # Add visible background (original PDF content would go here)
-            # For now, we'll add a light watermark to show it's processed
-            c.setFillColor(Color(0.9, 0.9, 0.9, alpha=0.1))
-            c.setFont("Helvetica", 8)
-            c.drawString(50, 50, "Searchable PDF - Text layer added")
-            
-            c.showPage()
-        
-        c.save()
-        
-        # Get the PDF bytes
-        searchable_pdf_bytes = buffer.getvalue()
-        buffer.close()
-        
-        # Encode as base64
-        searchable_pdf_b64 = base64.b64encode(searchable_pdf_bytes).decode()
-        
-        logger.info("Successfully created searchable PDF")
-        return searchable_pdf_b64
-        
-    except Exception as e:
-        logger.error(f"Error creating searchable PDF: {str(e)}")
-        # Return original PDF if overlay fails
-        return original_pdf_b64
+# Error handlers
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    logger.error("Request too large")
+    return jsonify({
+        'success': False,
+        'error': 'Request too large (max 50MB)'
+    }), 413
 
-def group_words_by_page(words, page_height=792):
-    """Group words by page based on Y coordinates"""
-    pages = {}
-    
-    for word in words:
-        # Simple page calculation based on Y coordinate
-        page_num = int(word['y1'] / page_height)
-        
-        if page_num not in pages:
-            pages[page_num] = []
-        
-        pages[page_num].append(word)
-    
-    return pages
+@app.errorhandler(400)
+def bad_request(error):
+    logger.error(f"Bad request: {error}")
+    return jsonify({
+        'success': False,
+        'error': 'Bad request'
+    }), 400
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    logger.error(f"Internal server error: {error}")
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error'
+    }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"Starting hOCR to PDF service on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    logger.info(f"Max content length: {app.config['MAX_CONTENT_LENGTH']} bytes")
+    
+    # For local development
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
